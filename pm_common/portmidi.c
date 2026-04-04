@@ -9,6 +9,10 @@
 #include "pminternal.h"
 #include <assert.h>
 
+#if defined(PMALSA)
+extern const char *pm_linuxalsa_get_persistent_id(PmDeviceID id);
+#endif
+
 #define MIDI_CLOCK      0xf8
 #define MIDI_ACTIVE     0xfe
 #define MIDI_STATUS_MASK 0x80
@@ -375,6 +379,49 @@ PMEXPORT const PmDeviceInfo* Pm_GetDeviceInfo(PmDeviceID id)
         return &pm_descriptors[id].pub;
     }
     return NULL;
+}
+
+PMEXPORT const char *Pm_GetDevicePersistentId(PmDeviceID id)
+{
+    const PmDeviceInfo *info = Pm_GetDeviceInfo(id);
+    if (!info) {
+        return NULL;
+    }
+
+#if defined(PMALSA)
+    if (strcmp(info->interf, "ALSA") == 0) {
+        return pm_linuxalsa_get_persistent_id(id);
+    }
+#endif
+
+    return NULL;
+}
+
+PMEXPORT PmDeviceID Pm_FindDeviceByPersistentId(const char *persistent_id,
+                                                int is_input)
+{
+    int i;
+
+    if (!persistent_id) {
+        return pmNoDevice;
+    }
+
+    Pm_Initialize();
+    for (i = 0; i < pm_descriptor_len; i++) {
+        const PmDeviceInfo *info = Pm_GetDeviceInfo(i);
+        const char *candidate;
+
+        if (!info || info->input != is_input) {
+            continue;
+        }
+
+        candidate = Pm_GetDevicePersistentId(i);
+        if (candidate && strcmp(candidate, persistent_id) == 0) {
+            return i;
+        }
+    }
+
+    return pmNoDevice;
 }
 
 /* pm_success_fn -- "noop" function pointer */

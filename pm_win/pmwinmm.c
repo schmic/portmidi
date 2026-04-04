@@ -197,7 +197,7 @@ static void pm_winmm_mapper_input(void)
                             sizeof(MIDIINCAPS));
     if (wRtn == MMSYSERR_NOERROR) {
         pm_add_device_w("MMSystem", midi_in_mapper_caps.szPname, TRUE, FALSE,
-                        (void *) (intptr_t) MIDIMAPPER, 
+                        (void *) (intptr_t) MIDIMAPPER,
                         &pm_winmm_in_dictionary);
     }
 }
@@ -236,7 +236,7 @@ static void pm_winmm_mapper_output(void)
                              & midi_out_mapper_caps, sizeof(MIDIOUTCAPS));
     if (wRtn == MMSYSERR_NOERROR) {
         pm_add_device_w("MMSystem", midi_out_mapper_caps.szPname, FALSE, FALSE,
-                        (void *) (intptr_t) MIDIMAPPER, 
+                        (void *) (intptr_t) MIDIMAPPER,
                         &pm_winmm_out_dictionary);
     }
 }

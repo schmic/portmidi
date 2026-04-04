@@ -18,6 +18,14 @@
 #include "pminternal.h"
 #include "pmlinuxalsa.h"
 #include "string.h"
+#include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
 #include "porttime.h"
 
 #include <alsa/asoundlib.h>
@@ -35,11 +43,6 @@
 #error needs ALSA 0.9.0 or later
 #endif
 
-/* to store client/port in the device descriptor */
-#define MAKE_DESCRIPTOR(client, port) ((void*)(long)(((client) << 8) | (port)))
-#define GET_DESCRIPTOR_CLIENT(info) ((((long)(info)) >> 8) & 0xff)
-#define GET_DESCRIPTOR_PORT(info) (((long)(info)) & 0xff)
-
 #define BYTE unsigned char
 
 extern pm_fns_node pm_linuxalsa_in_dictionary;
@@ -50,6 +53,13 @@ static snd_seq_t *seq = NULL; /* all input comes here,
 static int queue, queue_used; /* one for all ports, reference counted */
 
 #define PORT_IS_CLOSED -999999
+
+typedef struct alsa_descriptor_struct {
+    int client;
+    int port;
+    int card;
+    char *persistent_id;
+} alsa_descriptor_node, *alsa_descriptor_type;
 
 typedef struct alsa_info_struct {
     int is_virtual;
@@ -84,6 +94,100 @@ static PmError check_hosterror(int err)
         return pmHostError;
     }
     return pmNoError;
+}
+
+static char *pm_strdup_printf(const char *format, ...)
+{
+    va_list ap;
+    va_list ap_copy;
+    int len;
+    char *result;
+
+    va_start(ap, format);
+    va_copy(ap_copy, ap);
+    len = vsnprintf(NULL, 0, format, ap_copy);
+    va_end(ap_copy);
+    if (len < 0) {
+        va_end(ap);
+        return NULL;
+    }
+
+    result = (char *) pm_alloc((size_t) len + 1);
+    if (!result) {
+        va_end(ap);
+        return NULL;
+    }
+
+    vsnprintf(result, (size_t) len + 1, format, ap);
+    va_end(ap);
+    return result;
+}
+
+static void alsa_trim_sound_card_suffix(char *path)
+{
+    char *suffix = strstr(path, "/sound/card");
+    if (suffix) {
+        *suffix = 0;
+    }
+}
+
+static char *alsa_make_persistent_id(int card, int seq_port, int is_input)
+{
+    char sysfs_link[64];
+    char resolved[PATH_MAX];
+
+    if (card < 0) {
+        return NULL;
+    }
+
+    snprintf(sysfs_link, sizeof(sysfs_link), "/sys/class/sound/card%d/device",
+             card);
+    if (!realpath(sysfs_link, resolved)) {
+        return NULL;
+    }
+
+    alsa_trim_sound_card_suffix(resolved);
+    return pm_strdup_printf("ALSA:sysfs=%s;seqport=%d;dir=%s",
+                            resolved, seq_port, is_input ? "in" : "out");
+}
+
+static alsa_descriptor_type alsa_descriptor_create(int client, int port,
+                                                   int card, int is_input)
+{
+    alsa_descriptor_type desc =
+            (alsa_descriptor_type) pm_alloc(sizeof(alsa_descriptor_node));
+    if (!desc) {
+        return NULL;
+    }
+
+    desc->client = client;
+    desc->port = port;
+    desc->card = card;
+    desc->persistent_id = alsa_make_persistent_id(card, port, is_input);
+    return desc;
+}
+
+static void alsa_descriptor_destroy(alsa_descriptor_type desc)
+{
+    if (!desc) {
+        return;
+    }
+    if (desc->persistent_id) {
+        pm_free(desc->persistent_id);
+    }
+    pm_free(desc);
+}
+
+const char *pm_linuxalsa_get_persistent_id(PmDeviceID id)
+{
+    alsa_descriptor_type desc;
+
+    if (id < 0 || id >= pm_descriptor_len || pm_descriptors[id].deleted) {
+        return NULL;
+    }
+
+    desc = (alsa_descriptor_type) pm_descriptors[id].descriptor;
+    return desc ? desc->persistent_id : NULL;
 }
 
 
@@ -141,13 +245,20 @@ static int midi_message_length(PmMessage message)
 }
 
 
-static alsa_info_type alsa_info_create(int client_port, long id, int is_virtual)
+static alsa_info_type alsa_info_create(alsa_descriptor_type desc,
+                                       long id, int is_virtual)
 {
     alsa_info_type info = (alsa_info_type) pm_alloc(sizeof(alsa_info_node));
+    if (!info || !desc) {
+        if (info) {
+            pm_free(info);
+        }
+        return NULL;
+    }
     info->is_virtual = is_virtual;
     info->this_port = id;
-    info->client = GET_DESCRIPTOR_CLIENT(client_port);
-    info->port = GET_DESCRIPTOR_PORT(client_port);
+    info->client = desc->client;
+    info->port = desc->port;
     info->in_sysex = 0;
     return info;
 }    
@@ -189,8 +300,9 @@ static void maybe_set_client_name(PmSysDepInfo *driverInfo)
 static PmError alsa_out_open(PmInternal *midi, void *driverInfo) 
 {
     int id = midi->device_id;
-    void *client_port = pm_descriptors[id].descriptor;
-    alsa_info_type ainfo = alsa_info_create((long) client_port, id,
+    alsa_descriptor_type desc =
+            (alsa_descriptor_type) pm_descriptors[id].descriptor;
+    alsa_info_type ainfo = alsa_info_create(desc, id,
                                             pm_descriptors[id].pub.is_virtual);
     snd_seq_port_info_t *pinfo;
     int err = 0;
@@ -337,6 +449,7 @@ static PmError alsa_create_virtual(int is_input, const char *name,
     snd_seq_port_info_t *pinfo;
     int err;
     int client, port;
+    alsa_descriptor_type desc;
     
     /* we need the id to set the port. */
     PmDeviceID id = pm_add_device("ALSA", name, is_input, TRUE, NULL,
@@ -367,7 +480,13 @@ static PmError alsa_create_virtual(int is_input, const char *name,
 
     client = snd_seq_port_info_get_client(pinfo);
     port = snd_seq_port_info_get_port(pinfo);
-    pm_descriptors[id].descriptor = MAKE_DESCRIPTOR(client, port);
+    desc = alsa_descriptor_create(client, port, -1, is_input);
+    if (!desc) {
+        snd_seq_delete_port(seq, port);
+        pm_undo_add_device(id);
+        return pmInsufficientMemory;
+    }
+    pm_descriptors[id].descriptor = desc;
     return id;
 }
 
@@ -375,6 +494,8 @@ static PmError alsa_create_virtual(int is_input, const char *name,
  static PmError alsa_delete_virtual(PmDeviceID id)
  {
      int err = snd_seq_delete_port(seq, id);
+     alsa_descriptor_destroy((alsa_descriptor_type) pm_descriptors[id].descriptor);
+     pm_descriptors[id].descriptor = NULL;
      return check_hosterror(err);
  }
  
@@ -382,8 +503,9 @@ static PmError alsa_create_virtual(int is_input, const char *name,
 static PmError alsa_in_open(PmInternal *midi, void *driverInfo)
 {
     int id = midi->device_id;
-    void *client_port = pm_descriptors[id].descriptor;
-    alsa_info_type ainfo = alsa_info_create((long) client_port, id,
+    alsa_descriptor_type desc =
+            (alsa_descriptor_type) pm_descriptors[id].descriptor;
+    alsa_info_type ainfo = alsa_info_create(desc, id,
                                             pm_descriptors[id].pub.is_virtual);
     snd_seq_port_info_t *pinfo;
     snd_seq_port_subscribe_t *sub;
@@ -832,6 +954,27 @@ char *pm_strdup(const char *s)
     return dup;
 }
 
+static PmError alsa_register_device(char *name, int card, int client, int port,
+                                    int is_input, pm_fns_type dictionary)
+{
+    PmError id;
+    alsa_descriptor_type desc = alsa_descriptor_create(client, port, card,
+                                                       is_input);
+    if (!desc) {
+        pm_free(name);
+        return pmInsufficientMemory;
+    }
+
+    id = pm_add_device("ALSA", name, is_input, FALSE, desc, dictionary);
+    if (id < 0) {
+        alsa_descriptor_destroy(desc);
+        pm_free(name);
+        return id;
+    }
+
+    return id;
+}
+
 
 PmError pm_linuxalsa_init(void)
 {
@@ -860,6 +1003,7 @@ PmError pm_linuxalsa_init(void)
 
     snd_seq_client_info_set_client(cinfo, -1);
     while (snd_seq_query_next_client(seq, cinfo) == 0) {
+        int card = snd_seq_client_info_get_card(cinfo);
         snd_seq_port_info_set_client(pinfo,
                                      snd_seq_client_info_get_client(cinfo));
         snd_seq_port_info_set_port(pinfo, -1);
@@ -873,22 +1017,26 @@ PmError pm_linuxalsa_init(void)
             if (caps & SND_SEQ_PORT_CAP_SUBS_WRITE) {
                 if (pm_default_output_device_id == -1) 
                     pm_default_output_device_id = pm_descriptor_len;
-                pm_add_device("ALSA",
+                err = alsa_register_device(
                         pm_strdup(snd_seq_port_info_get_name(pinfo)),
-                        FALSE, FALSE,
-                        MAKE_DESCRIPTOR(snd_seq_port_info_get_client(pinfo),
-                                        snd_seq_port_info_get_port(pinfo)),
+                        card,
+                        snd_seq_port_info_get_client(pinfo),
+                        snd_seq_port_info_get_port(pinfo),
+                        FALSE,
                         &pm_linuxalsa_out_dictionary);
+                if (err < 0) goto error_return;
             }
             if (caps & SND_SEQ_PORT_CAP_SUBS_READ) {
                 if (pm_default_input_device_id == -1) 
                     pm_default_input_device_id = pm_descriptor_len;
-                pm_add_device("ALSA",
+                err = alsa_register_device(
                         pm_strdup(snd_seq_port_info_get_name(pinfo)),
-                        TRUE, FALSE,
-                        MAKE_DESCRIPTOR(snd_seq_port_info_get_client(pinfo),
-                                        snd_seq_port_info_get_port(pinfo)),
+                        card,
+                        snd_seq_port_info_get_client(pinfo),
+                        snd_seq_port_info_get_port(pinfo),
+                        TRUE,
                         &pm_linuxalsa_in_dictionary);
+                if (err < 0) goto error_return;
             }
         }
     }
@@ -902,7 +1050,23 @@ PmError pm_linuxalsa_init(void)
 void pm_linuxalsa_term(void)
 {
     if (seq) {
+        int i;
         snd_seq_close(seq);
+        seq = NULL;
+
+        for (i = 0; i < pm_descriptor_len; i++) {
+            if (pm_descriptors[i].pub.name) {
+                pm_free(pm_descriptors[i].pub.name);
+                pm_descriptors[i].pub.name = NULL;
+            }
+            if (pm_descriptors[i].pub.interf &&
+                    strcmp(pm_descriptors[i].pub.interf, "ALSA") == 0) {
+                alsa_descriptor_destroy(
+                        (alsa_descriptor_type) pm_descriptors[i].descriptor);
+            }
+            pm_descriptors[i].descriptor = NULL;
+        }
+
         pm_free(pm_descriptors);
         pm_descriptors = NULL;
         pm_descriptor_len = 0;

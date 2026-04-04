@@ -377,6 +377,29 @@ typedef PmTimestamp (*PmTimeProcPtr)(void *time_info);
 */
 PMEXPORT const PmDeviceInfo *Pm_GetDeviceInfo(PmDeviceID id);
 
+/**
+ Returns a backend-defined persistent identifier for a device, or NULL if the
+ backend does not provide one. The returned pointer is owned by PortMidi and is
+ valid between calls to Pm_Initialize() and Pm_Terminate().
+
+ For ALSA devices on Linux, the identifier is derived from the stable sysfs
+ device path and the sequencer port direction. Applications can persist these
+ identifiers and resolve them again after a rescan.
+ */
+PMEXPORT const char *Pm_GetDevicePersistentId(PmDeviceID id);
+
+/**
+ Find a device by a previously stored persistent identifier.
+
+ @param persistent_id a string previously returned by
+ #Pm_GetDevicePersistentId().
+ @param is_input non-zero to search input devices, zero to search output
+ devices.
+ @return the matching device ID, or #pmNoDevice if no match is found.
+ */
+PMEXPORT PmDeviceID Pm_FindDeviceByPersistentId(const char *persistent_id,
+                                                int is_input);
+
 /** Open a MIDI device for input.
 
     @param stream the address of a #PortMidiStream pointer which will

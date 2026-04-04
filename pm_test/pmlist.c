@@ -46,13 +46,18 @@ int main(int argc, char *argv[])
         default_out = Pm_GetDefaultOutputDeviceID();
         for (i = 0; i < Pm_CountDevices(); i++) {
             const PmDeviceInfo *info = Pm_GetDeviceInfo(i);
+            const char *persistent_id = Pm_GetDevicePersistentId(i);
             printf("%d: %s, %s", i, info->interf, info->name);
             deflt = "";
             if (i == default_out || i == default_in) {
                 deflt = "default ";
             }
             in_or_out = (info->input ? "input" : "output");
-            printf(" (%s%s)\n", deflt, in_or_out);
+            printf(" (%s%s)", deflt, in_or_out);
+            if (persistent_id) {
+                printf("\n    persistent_id: %s", persistent_id);
+            }
+            printf("\n");
         }
         if (fgets(input, STRING_MAX, stdin) && input[0] == 'q') {
             return 0;
