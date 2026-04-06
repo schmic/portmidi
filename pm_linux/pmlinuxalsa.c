@@ -19,6 +19,8 @@
 #include "pmlinuxalsa.h"
 #include "string.h"
 #include "porttime.h"
+#include <limits.h>
+#include <stdio.h>
 
 #include <alsa/asoundlib.h>
 
@@ -832,6 +834,67 @@ char *pm_strdup(const char *s)
     return dup;
 }
 
+/* pm_alsa_get_port_suffix -- try to derive a stable USB path suffix from
+ * the ALSA card backing this sequencer client. For USB devices this resolves
+ * /sys/class/sound/cardN/device to a path such as .../1-3.2.1:1.0 and then
+ * strips the interface suffix after ':' to keep just the physical USB path
+ * (e.g. 1-3.2.1). Returns FALSE if no usable path is available.
+ */
+static int pm_alsa_get_port_suffix(snd_seq_client_info_t *cinfo,
+                                   char *suffix,
+                                   size_t suffix_size)
+{
+    int card = snd_seq_client_info_get_card(cinfo);
+    char linkpath[PATH_MAX];
+    char resolved[PATH_MAX];
+    char *base;
+    size_t len;
+
+    if (card < 0) {
+        return FALSE;
+    }
+    snprintf(linkpath, sizeof(linkpath), "/sys/class/sound/card%d/device", card);
+    if (!realpath(linkpath, resolved)) {
+        return FALSE;
+    }
+    base = strrchr(resolved, '/');
+    if (!base || !*(base + 1)) {
+        return FALSE;
+    }
+    base++;
+    len = strcspn(base, ":");
+    if (len == 0 || len + 1 > suffix_size) {
+        return FALSE;
+    }
+    memcpy(suffix, base, len);
+    suffix[len] = 0;
+    return TRUE;
+}
+
+/* pm_alsa_create_port_name -- create a PortMidi-visible device name with a
+ * location suffix. Prefer the stable USB path when available; otherwise fall
+ * back to the ALSA sequencer client:port pair.
+ */
+static char *pm_alsa_create_port_name(snd_seq_client_info_t *cinfo,
+                                      snd_seq_port_info_t *pinfo)
+{
+    char suffix[PATH_MAX];
+    char namebuf[PATH_MAX];
+    const char *name = snd_seq_port_info_get_name(pinfo);
+
+    if (!name) {
+        name = "Unknown";
+    }
+    if (pm_alsa_get_port_suffix(cinfo, suffix, sizeof(suffix))) {
+        snprintf(namebuf, sizeof(namebuf), "%s [%s]", name, suffix);
+    } else {
+        snprintf(namebuf, sizeof(namebuf), "%s [%d:%d]", name,
+                 snd_seq_port_info_get_client(pinfo),
+                 snd_seq_port_info_get_port(pinfo));
+    }
+    return pm_strdup(namebuf);
+}
+
 
 PmError pm_linuxalsa_init(void)
 {
@@ -874,7 +937,7 @@ PmError pm_linuxalsa_init(void)
                 if (pm_default_output_device_id == -1) 
                     pm_default_output_device_id = pm_descriptor_len;
                 pm_add_device("ALSA",
-                        pm_strdup(snd_seq_port_info_get_name(pinfo)),
+                        pm_alsa_create_port_name(cinfo, pinfo),
                         FALSE, FALSE,
                         MAKE_DESCRIPTOR(snd_seq_port_info_get_client(pinfo),
                                         snd_seq_port_info_get_port(pinfo)),
@@ -884,7 +947,7 @@ PmError pm_linuxalsa_init(void)
                 if (pm_default_input_device_id == -1) 
                     pm_default_input_device_id = pm_descriptor_len;
                 pm_add_device("ALSA",
-                        pm_strdup(snd_seq_port_info_get_name(pinfo)),
+                        pm_alsa_create_port_name(cinfo, pinfo),
                         TRUE, FALSE,
                         MAKE_DESCRIPTOR(snd_seq_port_info_get_client(pinfo),
                                         snd_seq_port_info_get_port(pinfo)),
